@@ -2,7 +2,9 @@ package com.example.cryptodemo
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -11,21 +13,27 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import javax.crypto.AEADBadTagException
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.light(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.light(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT)
+        )
         setContent {
-            MaterialTheme(colorScheme = lightColorScheme(primary = Color(0xFF126B58))) {
-                CryptoDemo()
-            }
+            MaterialTheme(colorScheme = lightColorScheme(primary = Color(0xFF126B58))) { CryptoDemo() }
         }
     }
 }
@@ -34,125 +42,162 @@ class MainActivity : ComponentActivity() {
 private fun CryptoDemo() {
     val context = LocalContext.current.applicationContext
     val scope = rememberCoroutineScope()
+    val clipboard = LocalClipboardManager.current
     val keyboard = LocalSoftwareKeyboardController.current
     var store by remember { mutableStateOf<CryptoStore?>(null) }
     var token by remember { mutableStateOf("secret123") }
-    var ciphertext by remember { mutableStateOf("Đang đọc file…") }
+    var output by remember { mutableStateOf("") }
+    var input by remember { mutableStateOf("") }
     var decoded by remember { mutableStateOf<String?>(null) }
-    var status by remember { mutableStateOf("Đang mở Android Keystore…") }
+    var encryptStatus by remember { mutableStateOf("") }
+    var decryptStatus by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(true) }
-    var failed by remember { mutableStateOf(false) }
-    var showCode by remember { mutableStateOf(false) }
+    var decryptFailed by remember { mutableStateOf(false) }
+    var showDetails by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         try {
-            val (opened, raw) = withContext(Dispatchers.IO) {
+            val (opened, saved) = withContext(Dispatchers.IO) {
                 val opened = CryptoStore(context)
-                opened to opened.ciphertext()
+                opened to opened.savedCiphertext()
             }
             store = opened
-            ciphertext = raw
-            status = "Sẵn sàng. Bấm lưu token mới hoặc đọc token đã lưu."
+            output = saved.orEmpty()
+            encryptStatus = if (saved == null) "Sẵn sàng để mã hóa." else "Đã nạp bản mã từ lần lưu trước."
+        } catch (error: CancellationException) {
+            throw error
         } catch (error: Exception) {
-            failed = true
-            status = "Không mở được dữ liệu: ${error.localizedMessage}"
+            encryptStatus = "Không mở được khóa hoặc dữ liệu: ${error.localizedMessage}"
         } finally {
             busy = false
         }
     }
 
-    fun operate(save: Boolean) {
+    fun changeInput(value: String) {
+        input = value
+        decoded = null
+        decryptStatus = ""
+        decryptFailed = false
+    }
+
+    fun operate(encrypt: Boolean) {
+        if (busy) return
         val currentStore = store ?: return
-        val input = token
+        val value = if (encrypt) token else input
         keyboard?.hide()
         busy = true
-        failed = false
-        decoded = null
+        if (encrypt) {
+            encryptStatus = "Đang mã hóa…"
+        } else {
+            decoded = null
+            decryptFailed = false
+            decryptStatus = "Đang kiểm tra và giải mã…"
+        }
         scope.launch {
             try {
-                val (value, raw) = withContext(Dispatchers.IO) {
-                    val value = if (save) {
-                        currentStore.save(input)
-                        null
-                    } else currentStore.read()
-                    value to currentStore.ciphertext()
+                val result = withContext(Dispatchers.IO) {
+                    if (encrypt) currentStore.encrypt(value) else currentStore.decrypt(value)
                 }
-                decoded = value
-                ciphertext = raw
-                status = when {
-                    save -> "Đã mã hóa và ghi thành công vào file."
-                    value == null -> "Chưa có token đã lưu."
-                    else -> "Đã đọc và giải mã token từ dữ liệu đã lưu."
+                if (encrypt) {
+                    output = result
+                    encryptStatus = "Đã mã hóa và lưu. Copy bản mã để chuyển sang phần giải mã."
+                } else {
+                    decoded = result
+                    decryptStatus = "✓ Giải mã và kiểm tra tính toàn vẹn thành công."
                 }
+            } catch (error: CancellationException) {
+                throw error
             } catch (error: Exception) {
-                failed = true
-                status = "Thao tác thất bại: ${error.localizedMessage}"
+                if (encrypt) {
+                    encryptStatus = "Mã hóa thất bại: ${error.localizedMessage}"
+                } else {
+                    decryptFailed = true
+                    decryptStatus = if (error is AEADBadTagException)
+                        "Không giải mã được: bản mã đã bị sửa hoặc được tạo bằng khóa khác."
+                    else "Không giải mã được: ${error.localizedMessage}"
+                }
             } finally {
                 busy = false
             }
         }
     }
 
-    Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFFF3F6F4)) {
+    Surface(Modifier.fillMaxSize(), color = Color(0xFFF3F6F4)) {
         Column(
-            modifier = Modifier.safeDrawingPadding().imePadding()
-                .verticalScroll(rememberScrollState()).padding(20.dp),
+            Modifier.safeDrawingPadding().imePadding().verticalScroll(rememberScrollState()).padding(20.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             Text("CryptoDemo", style = MaterialTheme.typography.headlineLarge)
-            Text("Mã hóa dữ liệu lưu trên Android", style = MaterialTheme.typography.titleMedium)
-            OutlinedTextField(
-                value = token, onValueChange = { token = it },
-                label = { Text("Token thử nghiệm") }, singleLine = true,
-                enabled = !busy, modifier = Modifier.fillMaxWidth()
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                Button(onClick = { operate(true) }, enabled = !busy && store != null && token.isNotEmpty(),
-                    modifier = Modifier.weight(1f)) { Text("Mã hóa & lưu") }
-                OutlinedButton(onClick = { operate(false) }, enabled = !busy && store != null,
-                    modifier = Modifier.weight(1f)) { Text("Đọc & giải mã") }
+            Text("Token → Bản mã → Copy → Dán → Giải mã", style = MaterialTheme.typography.bodyMedium)
+            Text("Khóa AES-256 được app giữ trong Android Keystore. Bản mã dùng lại được trên cùng bản cài app này.",
+                style = MaterialTheme.typography.bodySmall)
+            if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+            DemoCard("Mã hóa", Color(0xFFE4F2EC)) {
+                OutlinedTextField(
+                    token, { token = it }, label = { Text("Token cần mã hóa") },
+                    enabled = !busy, singleLine = true, modifier = Modifier.fillMaxWidth()
+                )
+                Button({ operate(true) }, enabled = !busy && store != null && token.isNotEmpty(),
+                    modifier = Modifier.fillMaxWidth()) { Text("Mã hóa token") }
+                Text(encryptStatus, style = MaterialTheme.typography.bodySmall)
+                if (output.isNotEmpty()) {
+                    Text("Bản mã vừa tạo hoặc đã lưu", style = MaterialTheme.typography.labelLarge)
+                    SelectionContainer {
+                        Text(output, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                    }
+                    OutlinedButton({
+                        clipboard.setText(AnnotatedString(output))
+                        encryptStatus = "Đã copy bản mã. Bấm Dán bản mã ở phần giải mã."
+                    }, enabled = !busy, modifier = Modifier.fillMaxWidth()) { Text("Copy bản mã") }
+                }
             }
-            if (busy) LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-            Text(status, color = if (failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
-            DemoCard("Token đọc lại") {
+            DemoCard("Giải mã") {
+                Text("Dán bản mã vào ô bên dưới rồi bấm Giải mã bản mã.",
+                    style = MaterialTheme.typography.bodyMedium)
+                TextButton({
+                    val pasted = clipboard.getText()?.text
+                    if (pasted.isNullOrBlank()) {
+                        decryptStatus = "Clipboard chưa có bản mã. Hãy bấm Copy bản mã trước."
+                    } else changeInput(pasted)
+                }, enabled = !busy) { Text("Dán bản mã") }
+                OutlinedTextField(
+                    input, { changeInput(it) }, label = { Text("Bản mã cần giải mã") },
+                    enabled = !busy, minLines = 3, maxLines = 6,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Button({ operate(false) }, enabled = !busy && store != null && input.isNotBlank(),
+                    modifier = Modifier.fillMaxWidth()) { Text("Giải mã bản mã") }
+                if (decryptStatus.isNotEmpty()) Text(
+                    decryptStatus, style = MaterialTheme.typography.bodySmall,
+                    color = if (decryptFailed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+                )
+                Text("Token khôi phục", style = MaterialTheme.typography.labelLarge)
                 SelectionContainer {
-                    Text(decoded ?: "Chưa đọc", style = MaterialTheme.typography.titleLarge)
-                }
-                decoded?.let {
-                    Text(if (it == token) "✓ Khớp với ô nhập hiện tại" else "Khác với ô nhập hiện tại")
+                    Text(decoded ?: "Chưa giải mã", style = MaterialTheme.typography.titleLarge)
                 }
             }
-            DemoCard("Dữ liệu thực tế trong file") {
-                Text("encrypted_prefs.xml • mục token", style = MaterialTheme.typography.labelLarge)
-                SelectionContainer {
-                    Text(ciphertext, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
-                }
-                Text("Đọc trực tiếp tên và giá trị đã mã hóa trong XML. Hai mục keyset của thư viện được ẩn ở đây.",
+            Text("Thử sửa một ký tự trong bản mã rồi giải mã lại để kiểm tra phát hiện thay đổi.",
+                style = MaterialTheme.typography.bodySmall)
+            TextButton({ showDetails = !showDetails }) {
+                Text(if (showDetails) "Ẩn cách mã hóa hoạt động" else "Xem cách mã hóa hoạt động")
+            }
+            if (showDetails) DemoCard("Thuật toán và lưu trữ") {
+                Text("Bản mã copy/dán dùng AES-256-GCM của Android Cipher.")
+                Text("CD1. + Base64(nonce 12 byte + dữ liệu mã hóa + tag 16 byte)",
+                    fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                Text("Giải mã dùng chính bản mã bạn nhập và khóa trong Keystore, đồng thời xác thực tag.")
+                Text("Token và bản mã gần nhất được lưu bằng EncryptedSharedPreferences: AES-256-SIV cho tên mục, AES-256-GCM cho giá trị. MasterKey bảo vệ các bộ khóa.",
                     style = MaterialTheme.typography.bodySmall)
             }
-            DemoCard("Thuật toán đang sử dụng") {
-                Text("Tên mục token → AES-256-SIV\nGiá trị token → AES-256-GCM\nMasterKey → AES-256-GCM trong Android Keystore")
-                Text("MasterKey bảo vệ các bộ khóa. AES-GCM mã hóa giá trị và kiểm tra tính toàn vẹn.",
-                    style = MaterialTheme.typography.bodySmall)
-                TextButton(onClick = { showCode = !showCode }) {
-                    Text(if (showCode) "Ẩn cấu hình Kotlin" else "Xem cấu hình Kotlin")
-                }
-                if (showCode) SelectionContainer {
-                    Text("MasterKey.KeyScheme.AES256_GCM\nPrefKeyEncryptionScheme.AES256_SIV\nPrefValueEncryptionScheme.AES256_GCM",
-                        fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
-                }
-            }
-            Text("Thử lưu một token tự chọn → Force stop app → mở lại → bấm Đọc & giải mã. App chỉ ghi khi bạn bấm Lưu.",
-                style = MaterialTheme.typography.bodyMedium)
         }
     }
 }
 
 @Composable
-private fun DemoCard(title: String, content: @Composable ColumnScope.() -> Unit) {
-    Card(modifier = Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = Color.White)) {
+private fun DemoCard(title: String, color: Color = Color.White, content: @Composable ColumnScope.() -> Unit) {
+    Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = color)) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text(title, style = MaterialTheme.typography.titleMedium)
+            Text(title, style = MaterialTheme.typography.titleLarge)
             content()
         }
     }
